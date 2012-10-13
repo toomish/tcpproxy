@@ -1,0 +1,9 @@
+.*
+*.o
+*~
+tags
+
+!.gitignore
+
+tcpproxy
+tcpstat
