@@ -68,7 +68,6 @@ static void init_handlers(void);
 static void wait_childs(void);
 static int isnumber(const char *str);
 static void on_quit(void);
-static void quit(void);
 
 static void makeaddr(struct sockaddr_in *sa, const char *host, const char *port);
 static int portbyname(const char *name);
@@ -178,7 +177,7 @@ static void sighandler(int signum)
 	if (signum == SIGCHLD)
 		die_childs++;
 	else
-		quit();
+		exit(0);
 }
 
 static void wait_childs(void)
@@ -299,12 +298,6 @@ static void on_quit(void)
 		if (UNIX_SOCKET_PATH[0] != '\0' && unlink(UNIX_SOCKET_PATH) < 0)
 			sys_err("unlink");
 	}
-}
-
-static void quit(void)
-{
-	on_quit();
-	exit(0);
 }
 
 static int isnumber(const char *str)
