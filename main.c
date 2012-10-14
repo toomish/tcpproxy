@@ -555,17 +555,17 @@ static void test_chans(fd_set *readfds, fd_set *writefds, fd_set *exceptfds)
 			else
 				DEBUG_CODE(
 					msg_warn("read from %s %d bytes",
-						remote_addr, n);
+						chan->server->remote_addr, n);
 				);
 		}
 
 		if (fd2 >= 0 && FD_ISSET(fd2, writefds)) {
-			if (bwrite(b1, fd2) < 0)
+			if ((n = bwrite(b1, fd2)) < 0)
 				shut(&fd2);
 			else
 				DEBUG_CODE(
 					msg_warn("write to %s %d bytes",
-						remote_addr, n);
+						chan->server->remote_addr, n);
 				);
 		}
 
@@ -577,8 +577,11 @@ static void test_chans(fd_set *readfds, fd_set *writefds, fd_set *exceptfds)
 		chan->fd1 = fd1;
 		chan->fd2 = fd2;
 
-		if (fd1 < 0 && fd2 < 0)
+		if (fd1 < 0 && fd2 < 0) {
+			fprintf(stderr, "close: %s to %s\n", chan->addr,
+				chan->server->remote_addr);
 			chan_free(chan);
+		}
 	}
 }
 
@@ -599,12 +602,18 @@ static void accept_client(struct server *server, int serv_sock)
 	}
 
 	fd2 = tcp_socket();
-	chan = chan_new(server, addrstr(&sa), fd1, fd2);
 	ret = connect(fd2, (struct sockaddr *) &server->remote_sa, sizeof(struct sockaddr_in));
+	if (ret < 0 && errno != EINPROGRESS) {
+		close(fd1);
+		close(fd2);
+
+		msg_err("connect");
+		return;
+	}
+
+	chan = chan_new(server, addrstr(&sa), fd1, fd2);
 	if (ret == 0)
 		chan->connected++;
-	else if (errno != EINPROGRESS)
-		sys_err("connect");
 
 	fprintf(stderr, "accept: %s to %s\n", chan->addr, server->remote_addr);
 }
