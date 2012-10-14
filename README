@@ -1,0 +1,17 @@
+tcpproxy - proxy for tcp connections
+
+Usage: tcpproxy config
+
+Format of config file: each line containes following three values:
+local_port host port
+
+Where:
+	local_port - local port to listen
+	host - ip address of remote host
+	port - remote port
+Port value may be specified as a service name
+
+Example:
+4000 remoteip ssh - connection to 0.0.0.0:4000 will be forwarded to remoteip:22
+
+tcpstat - tool for retrieve information about current connections from tcpproxy
