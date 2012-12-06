@@ -642,49 +642,24 @@ static int test_servs(fd_set *readfds)
 	return count;
 }
 
-static int store_info(char **ptr)
+void send_info(int sock)
 {
 	struct channel *chan;
-	FILE *stream;
-	size_t size = 0;
 	int total = 0;
+	FILE *fp;
 
-	stream = open_memstream(ptr, &size);
-	if (stream == NULL)
-		sys_err("open_memstream");
+	fp = fdopen(sock, "w");
 
 	LIST_FOREACH(chan, &channels, entries) {
-		fprintf(stream, "%s => %s", chan->addr, chan->server->remote_addr);
+		fprintf(fp, "%s => %s", chan->addr, chan->server->remote_addr);
 		if (chan->connected == 0)
-			fprintf(stream, ": not connected");
-		fprintf(stream, "\n");
+			fprintf(fp, ": not connected");
+		fprintf(fp, "\n");
 		total++;
 	}
 
-	fprintf(stream, "total: %d\n", total);
-	fclose(stream);
-
-	return size;
-}
-
-void send_info(int sock)
-{
-	char *buf = NULL;
-	char *p;
-	size_t size;
-	int n;
-
-	size = store_info(&buf);
-	p = buf;
-	while (size > 0) {
-		n = write(sock, p, size);
-		if (n < 0)
-			sys_err("write");
-		size -= n;
-		p += n;
-	}
-
-	free(buf);
+	fprintf(fp, "total: %d\n", total);
+	fclose(fp);
 }
 
 static void accept_unix(int unix_sock)
