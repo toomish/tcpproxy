@@ -1,0 +1,2 @@
+1. replace open_memstream with standart functions in store_info
+2. use list from sys/queue.h
