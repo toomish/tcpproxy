@@ -1,6 +1,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/select.h>
+#include <sys/queue.h>
 #include <sys/wait.h>
 #include <sys/un.h>
 
@@ -20,14 +21,19 @@
 #include "buffer.h"
 #include "debug.h"
 #include "xwrap.h"
-#include "list.h"
 #include "data.h"
+
+#define LIST_FOREACH_SAFE(var, tmp, head, field) \
+	for (	(var) = LIST_FIRST(head), (tmp) = LIST_NEXT(var, field); \
+		(var); \
+		(var) = (tmp), (tmp) = (var) ? LIST_NEXT(var, field) : NULL)
 
 #define NELEM(p) (sizeof(p) / sizeof(p[0]))
 #define BUFSIZE 0x1000
 
-static struct list_head channels;
-static struct list_head servers;
+LIST_HEAD(channel_list, channel) channels;
+SLIST_HEAD(server_list, server) servers;
+
 static int die_childs;
 static pid_t main_pid;
 
@@ -36,7 +42,8 @@ struct server {
 	char *remote_addr;
 	struct sockaddr_in remote_sa;
 	int nchannel;
-	struct list_head serv_list;
+
+	SLIST_ENTRY(server) entries;
 };
 
 struct channel {
@@ -47,7 +54,8 @@ struct channel {
 	int connected;
 	char *addr;
 	struct server *server;
-	struct list_head chan_list;
+
+	LIST_ENTRY(channel) entries;
 };
 
 static inline int max(int a, int b)
@@ -125,13 +133,13 @@ int main(int argc, char *argv[])
 	main_pid = getpid();
 	atexit(on_quit);
 
-	INIT_LIST_HEAD(&servers);
+	SLIST_INIT(&servers);
 
 	setservent(1);
 	read_config_file(argv[1]);
 	endservent();
 
-	INIT_LIST_HEAD(&channels);
+	LIST_INIT(&channels);
 	init_handlers();
 	endless_loop(unix_sock);
 
@@ -228,8 +236,8 @@ static struct channel *chan_new(struct server *s, char *addr, int fd1, int fd2)
 	p->addr = addr;
 	p->connected = 0;
 	p->server = s;
-	INIT_LIST_HEAD(&p->chan_list);
-	list_add(&p->chan_list, &channels);
+
+	LIST_INSERT_HEAD(&channels, p, entries);
 
 	s->nchannel++;
 
@@ -249,7 +257,7 @@ static void chan_free(struct channel *chan)
 		shut(&chan->fd2);
 
 	free(chan->addr);
-	list_del(&chan->chan_list);
+	LIST_REMOVE(chan, entries);
 	free(chan);
 
 	s->nchannel--;
@@ -270,8 +278,7 @@ static void serv_add_new(char *local_port, char *host, char *port)
 	makeaddr(&sa, "0.0.0.0", local_port);
 	s->sock = tcp_server((struct sockaddr *) &sa, sizeof(sa));
 
-	INIT_LIST_HEAD(&s->serv_list);
-	list_add(&s->serv_list, &servers);
+	SLIST_INSERT_HEAD(&servers, s, entries);
 }
 
 static inline int tcp_socket(void)
@@ -416,7 +423,7 @@ static int add_chans(fd_set *readfds, fd_set *writefds, fd_set *exceptfds)
 	int fd1, fd2;
 	int nfds = -1;
 
-	list_for_each_entry(chan, &channels, chan_list) {
+	LIST_FOREACH(chan, &channels, entries) {
 		b1 = &chan->buf1;
 		b2 = &chan->buf2;
 		fd1 = chan->fd1;
@@ -457,7 +464,7 @@ static int add_servs(fd_set *readfds)
 	struct server *server;
 	int nfds = -1;
 
-	list_for_each_entry(server, &servers, serv_list) {
+	SLIST_FOREACH(server, &servers, entries) {
 		int fd = server->sock;
 
 		FD_SET(fd, readfds);
@@ -491,7 +498,7 @@ static void test_chans(fd_set *readfds, fd_set *writefds, fd_set *exceptfds)
 	int fd1, fd2;
 	int n;
 
-	list_for_each_entry_safe(chan, tmp, &channels, chan_list) {
+	LIST_FOREACH_SAFE(chan, tmp, &channels, entries) {
 		b1 = &chan->buf1;
 		b2 = &chan->buf2;
 		fd1 = chan->fd1;
@@ -623,7 +630,7 @@ static int test_servs(fd_set *readfds)
 	struct server *server;
 	int count = 0;
 
-	list_for_each_entry(server, &servers, serv_list) {
+	SLIST_FOREACH(server, &servers, entries) {
 		int fd = server->sock;
 
 		if (FD_ISSET(fd, readfds)) {
@@ -645,7 +652,8 @@ static int store_info(char **ptr)
 	stream = open_memstream(ptr, &size);
 	if (stream == NULL)
 		sys_err("open_memstream");
-	list_for_each_entry(chan, &channels, chan_list) {
+
+	LIST_FOREACH(chan, &channels, entries) {
 		fprintf(stream, "%s => %s", chan->addr, chan->server->remote_addr);
 		if (chan->connected == 0)
 			fprintf(stream, ": not connected");
