@@ -30,12 +30,12 @@
 
 #define NELEM(p) (sizeof(p) / sizeof(p[0]))
 #define BUFSIZE 0x1000
+#define CMDLEN 32
+
+#define bputconst(b, s) bputs(b, s, sizeof(s) - 1)
 
 LIST_HEAD(channel_list, channel) channels;
 SLIST_HEAD(server_list, server) servers;
-
-static int die_childs;
-static pid_t main_pid;
 
 struct server {
 	int sock;
@@ -54,8 +54,27 @@ struct channel {
 	int connected;
 	char *addr;
 	struct server *server;
+	char control;
+	char control_shutdown;
 
 	LIST_ENTRY(channel) entries;
+};
+
+struct command {
+	char *name;
+	int (*handler)(struct buffer *out);
+};
+
+static int cmd_list(struct buffer *out);
+static int cmd_quit(struct buffer *out);
+static int cmd_bye(struct buffer *out);
+
+struct command commands[] = {
+	{ "list", cmd_list },
+	{ "quit", cmd_quit },
+	{ "exit", cmd_quit },
+	{ "bye", cmd_bye },
+	{ NULL, NULL }
 };
 
 static inline int max(int a, int b)
@@ -73,7 +92,6 @@ static inline void shut(int *fd);
 static void usage(void);
 static void sighandler(int signum);
 static void init_handlers(void);
-static void wait_childs(void);
 static int isnumber(const char *str);
 static void on_quit(void);
 
@@ -130,7 +148,6 @@ int main(int argc, char *argv[])
 
 	unix_sock = unix_server(UNIX_SOCKET_PATH);
 
-	main_pid = getpid();
 	atexit(on_quit);
 
 	SLIST_INIT(&servers);
@@ -146,21 +163,6 @@ int main(int argc, char *argv[])
 	return 0;
 }
 
-static inline void xsigprocmask(int how, const sigset_t *set, sigset_t *oldset)
-{
-	int ret;
-
-	ret = sigprocmask(how, set, oldset);
-	if (ret < 0)
-		sys_err("sigprocmask");
-}
-
-static inline void xsigpending(sigset_t *set)
-{
-	if (sigpending(set) < 0)
-		sys_err("sigpending");
-}
-
 static void init_handlers(void)
 {
 	struct sigaction act;
@@ -170,10 +172,6 @@ static void init_handlers(void)
 	memset(&act, 0, sizeof(act));
 	act.sa_handler = sighandler;
 	act.sa_flags = SA_RESTART;
-	if (sigaction(SIGCHLD, &act, NULL) < 0)
-		sys_err("sigaction");
-	if (siginterrupt(SIGCHLD, 1) < 0)
-		sys_err("siginterrupt");
 
 	for (n = 0; n < NELEM(sigs); n++)
 		if (sigaction(sigs[n], &act, NULL) < 0)
@@ -182,46 +180,7 @@ static void init_handlers(void)
 
 static void sighandler(int signum)
 {
-	if (signum == SIGCHLD)
-		die_childs++;
-	else
-		exit(0);
-}
-
-static void wait_childs(void)
-{
-	int status;
-	pid_t pid;
-
-	for (;;) {
-		pid = waitpid(-1, &status, WNOHANG);
-		if (pid == 0)
-			goto out;
-		else if (pid == -1)
-			switch (errno) {
-			case ECHILD:
-				goto out;
-			case EINTR:
-				continue;
-			default:
-				sys_err("waitpid");
-			}
-
-		DEBUG_CODE(
-			fprintf(stderr, "child %d ", pid);
-			if (WIFEXITED(status))
-				fprintf(stderr, "exited with status %d\n",
-					WEXITSTATUS(status));
-			else if (WIFSIGNALED(status))
-				fprintf(stderr, "caught signal %d\n",
-					WTERMSIG(status));
-			else
-				fprintf(stderr, "died by unknown reason\n");
-		);
-	}
-
-out:
-	die_childs = 0;
+	exit(0);
 }
 
 static struct channel *chan_new(struct server *s, char *addr, int fd1, int fd2)
@@ -236,10 +195,13 @@ static struct channel *chan_new(struct server *s, char *addr, int fd1, int fd2)
 	p->addr = addr;
 	p->connected = 0;
 	p->server = s;
+	p->control = 0;
+	p->control_shutdown = 0;
 
 	LIST_INSERT_HEAD(&channels, p, entries);
 
-	s->nchannel++;
+	if (s != NULL)
+		s->nchannel++;
 
 	return p;
 }
@@ -260,7 +222,8 @@ static void chan_free(struct channel *chan)
 	LIST_REMOVE(chan, entries);
 	free(chan);
 
-	s->nchannel--;
+	if (s != NULL)
+		s->nchannel--;
 }
 
 static void serv_add_new(char *local_port, char *host, char *port)
@@ -301,10 +264,8 @@ static void usage(void)
 
 static void on_quit(void)
 {
-	if (main_pid == getpid()) {
-		if (UNIX_SOCKET_PATH[0] != '\0' && unlink(UNIX_SOCKET_PATH) < 0)
-			sys_err("unlink");
-	}
+	if (UNIX_SOCKET_PATH[0] != '\0' && unlink(UNIX_SOCKET_PATH) < 0)
+		sys_err("unlink");
 }
 
 static int isnumber(const char *str)
@@ -491,6 +452,87 @@ static inline int connected(int sock)
 	return -1;
 }
 
+static int cmd_list(struct buffer *out)
+{
+	struct channel *chan;
+	char buf[512];
+	int total = 0;
+	int n;
+
+	LIST_FOREACH(chan, &channels, entries) {
+		if (chan->control)
+			bputconst(out, "[control]\n");
+		else {
+			n = snprintf(buf, sizeof(buf), "%s => %s%s\n",
+				chan->addr, chan->server->remote_addr,
+				chan->connected ? "" : ": not connected"
+			);
+			if (n < 0) {
+				bputconst(out, "internal error\n");
+				return 0;
+			}
+
+			bputs(out, buf, n);
+		}
+
+		total++;
+	}
+
+	if ((n = snprintf(buf, sizeof(buf), "total: %d\n", total)) < 0) {
+		bputconst(out, "internal error\n");
+		return 0;
+	}
+
+	bputs(out, buf, n);
+
+	return 1;
+}
+
+static int cmd_quit(struct buffer *out)
+{
+	bputconst(out, "bye\n");
+	return 0;
+}
+
+static int cmd_bye(struct buffer *out)
+{
+	(void) out;
+	return 0;
+}
+
+static int control_process(struct buffer *in, struct buffer *out)
+{
+	struct command *cmd;
+	char buf[CMDLEN];
+	int n;
+
+	while ((n = bgets(in, buf, sizeof(buf))) > 0) {
+		if (buf[n - 1] != '\n') {
+			bputconst(out, "command too long\n");
+			return 0;
+		}
+
+		if (n == 1)
+			continue;
+
+		buf[n - 1] = '\0';
+
+		for (cmd = commands; cmd->name != NULL; cmd++) {
+			if (! strcmp(buf, cmd->name)) {
+				if (! cmd->handler(out))
+					return 0;
+
+				break;
+			}
+		}
+
+		if (cmd->name == NULL)
+			bputconst(out, "unknown command\n");
+	}
+
+	return 1;
+}
+
 static void test_chans(fd_set *readfds, fd_set *writefds, fd_set *exceptfds)
 {
 	struct channel *chan, *tmp;
@@ -529,11 +571,17 @@ static void test_chans(fd_set *readfds, fd_set *writefds, fd_set *exceptfds)
 		if (fd1 >= 0 && FD_ISSET(fd1, readfds)) {
 			if ((n = bread(b1, fd1)) < 0)
 				shut(&fd1);
-			else
+			else {
 				DEBUG_CODE(
 					msg_warn("read from %s %d bytes",
 						chan->addr, n);
 				);
+
+				if (chan->control) {
+					if (! control_process(b1, b2))
+						chan->control_shutdown = 1;
+				}
+			}
 		}
 
 		if (fd1 >= 0 && FD_ISSET(fd1, writefds)) {
@@ -576,17 +624,22 @@ static void test_chans(fd_set *readfds, fd_set *writefds, fd_set *exceptfds)
 				);
 		}
 
-		if (fd1 >= 0 && fd2 < 0 && bhasdata(b2) == 0)
-			shut(&fd1);
-		if (fd2 >= 0 && fd1 < 0 && bhasdata(b1) == 0)
-			shut(&fd2);
+		if (! chan->control || chan->control_shutdown) {
+			if (fd1 >= 0 && fd2 < 0 && bhasdata(b2) == 0)
+				shut(&fd1);
+			if (fd2 >= 0 && fd1 < 0 && bhasdata(b1) == 0)
+				shut(&fd2);
+		}
 
 		chan->fd1 = fd1;
 		chan->fd2 = fd2;
 
 		if (fd1 < 0 && fd2 < 0) {
-			fprintf(stderr, "close: %s to %s\n", chan->addr,
-				chan->server->remote_addr);
+			if (chan->control)
+				fprintf(stderr, "close unix\n");
+			else
+				fprintf(stderr, "close: %s to %s\n", chan->addr,
+					chan->server->remote_addr);
 			chan_free(chan);
 		}
 	}
@@ -642,29 +695,9 @@ static int test_servs(fd_set *readfds)
 	return count;
 }
 
-void send_info(int sock)
-{
-	struct channel *chan;
-	int total = 0;
-	FILE *fp;
-
-	fp = fdopen(sock, "w");
-
-	LIST_FOREACH(chan, &channels, entries) {
-		fprintf(fp, "%s => %s", chan->addr, chan->server->remote_addr);
-		if (chan->connected == 0)
-			fprintf(fp, ": not connected");
-		fprintf(fp, "\n");
-		total++;
-	}
-
-	fprintf(fp, "total: %d\n", total);
-	fclose(fp);
-}
-
 static void accept_unix(int unix_sock)
 {
-	pid_t pid;
+	struct channel *chan;
 	int sock;
 
 	sock = accept(unix_sock, NULL, NULL);
@@ -674,36 +707,20 @@ static void accept_unix(int unix_sock)
 		return;
 	}
 
-	pid = fork();
-	if (pid < 0) {
-		msg_err("fork");
-		return;
-	}
+	chan = chan_new(NULL, NULL, sock, -1);
+	chan->connected = 1;
+	chan->control = 1;
 
-	if (pid > 0) {
-		close(sock);
-		return;
-	}
-
-	send_info(sock);
-	close(sock);
-	exit(0);
+	fprintf(stderr, "accept unix\n");
 }
 
 static void endless_loop(int unix_sock)
 {
 	fd_set rd, wr, er;
-	sigset_t set, pend_set;
 	int nfds;
 	int ret;
 
-	sigemptyset(&set);
-	sigaddset(&set, SIGCHLD);
-
 	for (;;) {
-		if (die_childs)
-			wait_childs();
-
 		FD_ZERO(&rd);
 		FD_ZERO(&wr);
 		FD_ZERO(&er);
@@ -720,7 +737,6 @@ static void endless_loop(int unix_sock)
 			sys_err("select");
 		}
 
-		xsigprocmask(SIG_BLOCK, &set, NULL);
 		ret -= test_servs(&rd);
 
 		if (ret > 0 && FD_ISSET(unix_sock, &rd)) {
@@ -730,12 +746,6 @@ static void endless_loop(int unix_sock)
 
 		if (ret > 0)
 			test_chans(&rd, &wr, &er);
-
-		xsigpending(&pend_set);
-		if (sigismember(&pend_set, SIGCHLD))
-			wait_childs();
-
-		xsigprocmask(SIG_UNBLOCK, &set, NULL);
 	}
 }
 

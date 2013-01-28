@@ -17,4 +17,7 @@ int bwrite(struct buffer *b, int fd);
 int bcanfill(struct buffer *b);
 int bhasdata(struct buffer *b);
 
+int bgets(struct buffer *b, char *s, size_t len);
+int bputs(struct buffer *b, char *s, size_t len);
+
 #endif

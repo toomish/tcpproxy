@@ -9,6 +9,8 @@
 #include "debug.h"
 #include "data.h"
 
+#define COMMAND "list\nbye\n"
+
 static char buf[0x1000];
 
 int main(int argc, char *argv[])
@@ -26,6 +28,9 @@ int main(int argc, char *argv[])
 	strcpy(sa.sun_path, UNIX_SOCKET_PATH);
 	if (connect(sock, (struct sockaddr *) &sa, sizeof(sa)) < 0)
 		sys_err("connect");
+
+	if (write(sock, COMMAND, sizeof(COMMAND) - 1) < 0)
+		sys_err("write");
 
 	while ((n = read(sock, buf, sizeof(buf))) > 0) {
 		buf[n] = 0;
