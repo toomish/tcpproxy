@@ -39,6 +39,7 @@ SLIST_HEAD(server_list, server) servers;
 
 struct server {
 	int sock;
+	int local_port;
 	char *remote_addr;
 	struct sockaddr_in remote_sa;
 	int nchannel;
@@ -62,14 +63,16 @@ struct channel {
 
 struct command {
 	char *name;
-	int (*handler)(struct buffer *out);
+	int (*handler)(char **args, struct buffer *out);
 };
 
-static int cmd_list(struct buffer *out);
-static int cmd_quit(struct buffer *out);
-static int cmd_bye(struct buffer *out);
+static int cmd_echo(char **args, struct buffer *out);
+static int cmd_list(char **args, struct buffer *out);
+static int cmd_quit(char **args, struct buffer *out);
+static int cmd_bye(char **args, struct buffer *out);
 
 struct command commands[] = {
+	{ "echo", cmd_echo },
 	{ "list", cmd_list },
 	{ "quit", cmd_quit },
 	{ "exit", cmd_quit },
@@ -239,6 +242,7 @@ static void serv_add_new(char *local_port, char *host, char *port)
 
 	memset(&sa, 0, sizeof(sa));
 	makeaddr(&sa, "0.0.0.0", local_port);
+	s->local_port = ntohs(sa.sin_port);
 	s->sock = tcp_server((struct sockaddr *) &sa, sizeof(sa));
 
 	SLIST_INSERT_HEAD(&servers, s, entries);
@@ -452,7 +456,7 @@ static inline int connected(int sock)
 	return -1;
 }
 
-static int cmd_list(struct buffer *out)
+static int cmd_list_conn(struct buffer *out)
 {
 	struct channel *chan;
 	char buf[512];
@@ -488,22 +492,99 @@ static int cmd_list(struct buffer *out)
 	return 1;
 }
 
-static int cmd_quit(struct buffer *out)
+static int cmd_list_servers(struct buffer *out)
 {
+	struct server *serv;
+	char buf[512];
+	int n;
+
+	SLIST_FOREACH(serv, &servers, entries) {
+		n = snprintf(buf, sizeof(buf), "%d => %s: %d\n",
+			serv->local_port, serv->remote_addr, serv->nchannel
+		);
+		if (n < 0) {
+			bputconst(out, "internal error\n");
+			return 0;
+		}
+
+		bputs(out, buf, n);
+	}
+
+	return 1;
+}
+
+static int cmd_list(char **args, struct buffer *out)
+{
+	if (args[1] == NULL)
+		return cmd_list_conn(out);
+
+	if (! strcmp(args[1], "conn"))
+		return cmd_list_conn(out);
+
+	if (! strcmp(args[1], "servers"))
+		return cmd_list_servers(out);
+
+	bputconst(out, "unknown arg\n");
+	return 1;
+}
+
+static int cmd_quit(char **args, struct buffer *out)
+{
+	(void) args;
 	bputconst(out, "bye\n");
 	return 0;
 }
 
-static int cmd_bye(struct buffer *out)
+static int cmd_bye(char **args, struct buffer *out)
 {
+	(void) args;
 	(void) out;
 	return 0;
+}
+
+static int cmd_echo(char **args, struct buffer *out)
+{
+	char **p = args + 1;
+
+	if (*p != NULL)
+		bputs(out, *p, strlen(*p));
+
+	for (p++; *p != NULL; p++) {
+		bputs(out, " ", 1);
+		bputs(out, *p, strlen(*p));
+	}
+
+	bputs(out, "\n", 1);
+
+	return 1;
+}
+
+static void parse_args(char *buf, char **args, int nargs)
+{
+	char *s;
+
+	s = *args++ = buf;
+
+	for (nargs--; nargs > 0; nargs--) {
+		s = strchr(s, ' ');
+		if (s == NULL)
+			break;
+
+		*s = '\0';
+		while (*++s == ' ');
+
+		if (*s == '\0')
+			break;
+
+		*args++ = s;
+	}
 }
 
 static int control_process(struct buffer *in, struct buffer *out)
 {
 	struct command *cmd;
 	char buf[CMDLEN];
+	char *args[16] = { 0 };
 	int n;
 
 	while ((n = bgets(in, buf, sizeof(buf))) > 0) {
@@ -516,10 +597,11 @@ static int control_process(struct buffer *in, struct buffer *out)
 			continue;
 
 		buf[n - 1] = '\0';
+		parse_args(buf, args, NELEM(args) - 1);
 
 		for (cmd = commands; cmd->name != NULL; cmd++) {
 			if (! strcmp(buf, cmd->name)) {
-				if (! cmd->handler(out))
+				if (! cmd->handler(args, out))
 					return 0;
 
 				break;
