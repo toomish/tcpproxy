@@ -17,7 +17,11 @@ char *xstrdup(const char *s)
 {
 	int len;
 
+	if (s == NULL)
+		return NULL;
+
 	len = strlen(s) + 1;
+
 	return memcpy(xmalloc(len), s, len);
 }
 

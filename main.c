@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 
+#include <getopt.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
@@ -21,7 +22,6 @@
 #include "buffer.h"
 #include "debug.h"
 #include "xwrap.h"
-#include "data.h"
 
 #define LIST_FOREACH_SAFE(var, tmp, head, field) \
 	for (	(var) = LIST_FIRST(head), (tmp) = LIST_NEXT(var, field); \
@@ -36,6 +36,9 @@
 
 LIST_HEAD(channel_list, channel) channels;
 SLIST_HEAD(server_list, server) servers;
+
+static char *option_unix_socket_path;
+static char *option_config_path;
 
 struct server {
 	int sock;
@@ -142,21 +145,66 @@ static void read_config_file(char *name)
 	free(line);
 }
 
+static void usage(void)
+{
+	fprintf(stderr, "Usage:\n  %s [OPTION...]\n", PROGNAME);
+	fprintf(stderr, "\nHelp Options:\n");
+	fprintf(stderr, "  %-40sShow help options\n", "-h, --help");
+	fprintf(stderr, "\nApplication Options:\n");
+	fprintf(stderr, "  %-40sconfig file\n", "-c, --config");
+	fprintf(stderr, "  %-40sunix socket path\n\n", "-u, --unix");
+}
+
+static int parse_options(int argc, char **argv)
+{
+	static struct option options[] = {
+		{ "config", 1, NULL, 'c' },
+		{ "unix", 1, NULL, 'u' },
+		{ "help", 0, NULL, 'h' },
+		{ NULL, 0, NULL, 0 }
+	};
+
+	int opt;
+
+	while ((opt = getopt_long(argc, argv, "c:u:h", options, NULL)) != -1) {
+		switch (opt) {
+		case 'c':
+			option_config_path = xstrdup(optarg);
+			break;
+		case 'u':
+			option_unix_socket_path = xstrdup(optarg);
+			break;
+		case 'h':
+			usage();
+		default:
+			return -1;
+		}
+	}
+
+	if (option_config_path == NULL) {
+		fprintf(stderr, "config option missed\n");
+		return -1;
+	}
+
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
-	int unix_sock;
+	int unix_sock = -1;
 
-	if (argc < 2)
-		usage();
+	if (parse_options(argc, argv) < 0)
+		exit(EXIT_FAILURE);
 
-	unix_sock = unix_server(UNIX_SOCKET_PATH);
+	if (option_unix_socket_path != NULL)
+		unix_sock = unix_server(option_unix_socket_path);
 
 	atexit(on_quit);
 
 	SLIST_INIT(&servers);
 
 	setservent(1);
-	read_config_file(argv[1]);
+	read_config_file(option_config_path);
 	endservent();
 
 	LIST_INIT(&channels);
@@ -260,16 +308,14 @@ static inline int tcp_socket(void)
 	return sock;
 }
 
-static void usage(void)
-{
-	fprintf(stderr, "Usage: %s config_file\n", PROGNAME);
-	exit(1);
-}
-
 static void on_quit(void)
 {
-	if (UNIX_SOCKET_PATH[0] != '\0' && unlink(UNIX_SOCKET_PATH) < 0)
-		sys_err("unlink");
+	char *path = option_unix_socket_path;
+
+	if (path != NULL) {
+		if (path[0] != '\0' && unlink(path) < 0)
+			sys_err("unlink");
+	}
 }
 
 static int isnumber(const char *str)
@@ -807,10 +853,18 @@ static void endless_loop(int unix_sock)
 		FD_ZERO(&wr);
 		FD_ZERO(&er);
 
-		FD_SET(unix_sock, &rd);
+		if (unix_sock < 0)
+			nfds = -1;
+		else {
+			FD_SET(unix_sock, &rd);
+			nfds = unix_sock;
+		}
 
-		nfds = max(add_servs(&rd), unix_sock);
+		nfds = max(add_servs(&rd), nfds);
 		nfds = max(add_chans(&rd, &wr, &er), nfds);
+
+		if (nfds < 0)
+			break;
 
 		ret = select(nfds + 1, &rd, &wr, &er, NULL);
 		if (ret < 0) {
@@ -821,9 +875,11 @@ static void endless_loop(int unix_sock)
 
 		ret -= test_servs(&rd);
 
-		if (ret > 0 && FD_ISSET(unix_sock, &rd)) {
-			accept_unix(unix_sock);
-			ret--;
+		if (unix_sock >= 0) {
+			if (ret > 0 && FD_ISSET(unix_sock, &rd)) {
+				accept_unix(unix_sock);
+				ret--;
+			}
 		}
 
 		if (ret > 0)
