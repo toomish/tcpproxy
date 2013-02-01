@@ -1,17 +1,23 @@
 tcpproxy - proxy for tcp connections
 
-Usage: tcpproxy config
+Usage: tcpproxy [OPTION...]
+Application Options:
+  -c, --config                            config file
+  -u, --unix                              unix socket path
 
-Format of config file: each line containes following three values:
-local_port host port
+Config file format:
+local_port [type] host|path [port]
 
 Where:
 	local_port - local port to listen
+	type - tcp or unix, tcp if omitted
 	host - ip address of remote host
+	path - address of the unix socket
 	port - remote port
 Port value may be specified as a service name
 
 Example:
 4000 remoteip ssh - connection to 0.0.0.0:4000 will be forwarded to remoteip:22
+4001 unix /tmp/socket - connection to 0.0.0.0:4001 will be forwarded to /tmp/socket
 
-tcpstat - tool for retrieve information about current connections from tcpproxy
+tcpproxy_stat - tool for retrieve information about current connections from tcpproxy
