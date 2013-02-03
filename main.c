@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 
+#include <stdbool.h>
 #include <getopt.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -107,16 +108,16 @@ static void init_handlers(void);
 static int isnumber(const char *str);
 static void on_quit(void);
 
-static void makeaddr(struct sockaddr_in *sa, const char *host, const char *port);
+static bool makeaddr(struct sockaddr_in *sa, const char *host, const char *port);
 static int portbyname(const char *name);
 static char *addrstr(struct sockaddr_storage *ss);
 
 static struct channel *chan_new(struct server *s, char *addr, int fd1, int fd2);
 static void chan_free(struct channel *chan);
 
-static void server_add_tcp(char *local_port, char *host, char *port);
-static void server_add_unix(char *local_port, char *path);
-static void server_add_new(char *local_port, socket_type_t type, struct sockaddr_storage *ss);
+static bool server_add_tcp(char *local_port, char *host, char *port);
+static bool server_add_unix(char *local_port, char *path);
+static bool server_add_new(char *local_port, socket_type_t type, struct sockaddr_storage *ss);
 
 static void endless_loop(int unix_sock);
 
@@ -126,7 +127,7 @@ static void read_config_file(char *name)
 
 	char *line = NULL;
 	size_t len = 0;
-	int nline = 1;
+	int nline = 0;
 	FILE *fp;
 
 	if ((fp = fopen(name, "r")) == NULL)
@@ -135,8 +136,13 @@ static void read_config_file(char *name)
 	while (getline(&line, &len, fp) >= 0) {
 		char *local, *type;
 
+		nline++;
+
 		if ((local = strtok(line, delim)) == NULL)
 			goto invalid;
+
+		if (*local == '#')
+			continue;
 
 		if ((type = strtok(NULL, delim)) == NULL)
 			goto invalid;
@@ -147,7 +153,8 @@ static void read_config_file(char *name)
 			if (path == NULL)
 				goto invalid;
 
-			server_add_unix(local, path);
+			if (! server_add_unix(local, path))
+				goto invalid;
 		} else {
 			char *host, *port = NULL;
 
@@ -162,10 +169,9 @@ static void read_config_file(char *name)
 			if (port == NULL)
 				goto invalid;
 
-			server_add_tcp(local, host, port);
+			if (! server_add_tcp(local, host, port))
+				goto invalid;
 		}
-
-		nline++;
 	}
 
 	fclose(fp);
@@ -308,17 +314,18 @@ static void chan_free(struct channel *chan)
 		s->nchannel--;
 }
 
-static void server_add_tcp(char *local_port, char *host, char *port)
+static bool server_add_tcp(char *local_port, char *host, char *port)
 {
 	struct sockaddr_storage storage;
 
 	memset(&storage, 0, sizeof(storage));
-	makeaddr((struct sockaddr_in *) &storage, host, port);
+	if (! makeaddr((struct sockaddr_in *) &storage, host, port))
+		return false;
 
-	server_add_new(local_port, TCP, &storage);
+	return server_add_new(local_port, TCP, &storage);
 }
 
-static void server_add_unix(char *local_port, char *path)
+static bool server_add_unix(char *local_port, char *path)
 {
 	union {
 		struct sockaddr_storage storage;
@@ -329,13 +336,21 @@ static void server_add_unix(char *local_port, char *path)
 	sa.un.sun_family = AF_UNIX;
 	strcpy(sa.un.sun_path, path);
 
-	server_add_new(local_port, UNIX, &sa.storage);
+	return server_add_new(local_port, UNIX, &sa.storage);
 }
 
-static void server_add_new(char *local_port, socket_type_t type, struct sockaddr_storage *ss)
+static bool server_add_new(char *local_port, socket_type_t type, struct sockaddr_storage *ss)
 {
 	struct sockaddr_in sa;
 	struct server *s;
+	int sock;
+
+	if (! makeaddr(&sa, "0.0.0.0", local_port))
+		return false;
+
+	sock = tcp_server((struct sockaddr *) &sa, sizeof(sa));
+	if (sock < 0)
+		return false;
 
 	s = (struct server *) xmalloc(sizeof(*s));
 	s->nchannel = 0;
@@ -344,11 +359,12 @@ static void server_add_new(char *local_port, socket_type_t type, struct sockaddr
 	memcpy(&s->remote_sa, ss, sizeof(struct sockaddr_storage));
 	s->remote_addr = addrstr(&s->remote_sa);
 
-	makeaddr(&sa, "0.0.0.0", local_port);
 	s->local_port = ntohs(sa.sin_port);
-	s->sock = tcp_server((struct sockaddr *) &sa, sizeof(sa));
+	s->sock = sock;
 
 	SLIST_INSERT_HEAD(&servers, s, entries);
+
+	return true;
 }
 
 static inline int tcp_socket(void)
@@ -356,8 +372,11 @@ static inline int tcp_socket(void)
 	int sock;
 
 	sock = socket(PF_INET, SOCK_STREAM, 0);
-	if (sock < 0)
-		sys_err("socket");
+	if (sock < 0) {
+		msg_err("socket");
+		return -1;
+	}
+
 	set_nonblock(sock);
 
 	return sock;
@@ -392,20 +411,31 @@ static int portbyname(const char *name)
 		return htons(atoi(name));
 
 	se = getservbyname(name, "tcp");
-	if (se == NULL)
-		err_quit("unknown service %s", name);
+	if (se == NULL) {
+		msg_warn("unknown service %s", name);
+		return -1;
+	}
 
 	return se->s_port;
 }
 
-static void makeaddr(struct sockaddr_in *sa, const char *host, const char *port)
+static bool makeaddr(struct sockaddr_in *sa, const char *host, const char *port)
 {
+	int tmp;
+
+	if ((tmp = portbyname(port)) < 0)
+		return false;
+
 	memset(sa, 0, sizeof(*sa));
-	if (inet_aton(host, &sa->sin_addr) == 0)
-		err_quit("inet_aton %s failed", host);
+	if (inet_aton(host, &sa->sin_addr) == 0) {
+		msg_warn("inet_aton %s failed", host);
+		return false;
+	}
 
 	sa->sin_family = AF_INET;
-	sa->sin_port = portbyname(port);
+	sa->sin_port = tmp;
+
+	return true;
 }
 
 static char *addrstr(struct sockaddr_storage *ss)
@@ -441,17 +471,31 @@ static int tcp_server(struct sockaddr *sa, socklen_t addrlen)
 	int flag;
 	int sock;
 
-	sock = tcp_socket();
+	if ((sock = tcp_socket()) < 0)
+		return -1;
+
 	flag = 1;
 
-	if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag)) < 0)
-		sys_err("setsockopt SO_REUSEADDR failed");
-	if (bind(sock, sa, addrlen) < 0)
-		sys_err("bind");
-	if (listen(sock, 7) < 0)
-		sys_err("listen");
+	if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag)) < 0) {
+		msg_err("setsockopt SO_REUSEADDR failed");
+		goto fail;
+	}
+
+	if (bind(sock, sa, addrlen) < 0) {
+		msg_err("bind");
+		goto fail;
+	}
+
+	if (listen(sock, 7) < 0) {
+		msg_err("listen");
+		goto fail;
+	}
 
 	return sock;
+
+fail:
+	close(sock);
+	return -1;
 }
 
 static inline int unix_socket(void)
@@ -459,8 +503,11 @@ static inline int unix_socket(void)
 	int sock;
 
 	sock = socket(PF_UNIX, SOCK_STREAM, 0);
-	if (sock < 0)
-		sys_err("socket PF_UNIX");
+	if (sock < 0) {
+		msg_err("socket PF_UNIX");
+		return -1;
+	}
+
 	set_nonblock(sock);
 
 	return sock;
@@ -489,10 +536,12 @@ static void set_nonblock(int desc)
 
 	opts = fcntl(desc, F_GETFL);
 	if (opts < 0)
-		sys_err("fcntl");
-	opts |= O_NONBLOCK;
-	if (fcntl(desc, F_SETFL, opts) < 0)
-		sys_err("fcntl");
+		msg_err("fcntl");
+	else {
+		opts |= O_NONBLOCK;
+		if (fcntl(desc, F_SETFL, opts) < 0)
+			msg_err("fcntl");
+	}
 }
 
 static int add_chans(fd_set *readfds, fd_set *writefds, fd_set *exceptfds)
@@ -863,6 +912,11 @@ static void accept_client(struct server *server, int serv_sock)
 	} else if (server->type == UNIX) {
 		fd2 = unix_socket();
 		addrlen = sizeof(struct sockaddr_un);
+	}
+
+	if (fd2 < 0) {
+		close(fd1);
+		return;
 	}
 
 	ret = connect(fd2, (struct sockaddr *) &server->remote_sa, addrlen);
